@@ -1,189 +1,186 @@
 import math
-import numpy as np
-import tensorflow as tf
-
-tf1 = tf.compat.v1
-tf1.disable_eager_execution()
-
-class HParams:
-    def __init__(self, **kwargs):
-        self.__dict__.update(kwargs)
-
-    def override_from_dict(self, d):
-        self.__dict__.update(d)
-
-def default_hparams():
-    return HParams(
-        n_vocab=0,
-        n_ctx=1024,
-        n_embd=768,
-        n_head=12,
-        n_layer=12,
-    )
-
-def shape_list(x):
-    """Deal with dynamic shape in tensorflow cleanly."""
-    static = x.shape.as_list()
-    dynamic = tf.shape(x)
-    return [dynamic[i] if s is None else s for i, s in enumerate(static)]
-
-def softmax(x, axis=-1):
-    x = x - tf.reduce_max(x, axis=axis, keepdims=True)
-    ex = tf.exp(x)
-    return ex / tf.reduce_sum(ex, axis=axis, keepdims=True)
-
-def gelu(x):
-    return 0.5*x*(1+tf.tanh(np.sqrt(2/np.pi)*(x+0.044715*tf.pow(x, 3))))
-
-def norm(x, scope, *, axis=-1, epsilon=1e-5):
-    """Normalize to mean = 0, std = 1, then do a diagonal affine transform."""
-    with tf1.variable_scope(scope):
-        n_state = x.shape[-1]
-        g = tf1.get_variable('g', [n_state], initializer=tf1.constant_initializer(1))
-        b = tf1.get_variable('b', [n_state], initializer=tf1.constant_initializer(0))
-        u = tf.reduce_mean(x, axis=axis, keepdims=True)
-        s = tf.reduce_mean(tf.square(x-u), axis=axis, keepdims=True)
-        x = (x - u) * tf.math.rsqrt(s + epsilon)
-        x = x*g + b
-        return x
-
-def split_states(x, n):
-    """Reshape the last dimension of x into [n, x.shape[-1]/n]."""
-    *start, m = shape_list(x)
-    return tf.reshape(x, start + [n, m//n])
-
-def merge_states(x):
-    """Smash the last two dimensions of x into a single dimension."""
-    *start, a, b = shape_list(x)
-    return tf.reshape(x, start + [a*b])
-
-def conv1d(x, scope, nf, *, w_init_stdev=0.02):
-    with tf1.variable_scope(scope):
-        *start, nx = shape_list(x)
-        w = tf1.get_variable('w', [1, nx, nf], initializer=tf1.random_normal_initializer(stddev=w_init_stdev))
-        b = tf1.get_variable('b', [nf], initializer=tf1.constant_initializer(0))
-        c = tf.reshape(tf.matmul(tf.reshape(x, [-1, nx]), tf.reshape(w, [-1, nf]))+b, start+[nf])
-        return c
-
-def attention_mask(nd, ns, *, dtype):
-    """1's in the lower triangle, counting from the lower right corner.
-
-    Same as tf.matrix_band_part(tf.ones([nd, ns]), -1, ns-nd), but doesn't produce garbage on TPUs.
-    """
-    i = tf.range(nd)[:,None]
-    j = tf.range(ns)
-    m = i >= j - ns + nd
-    return tf.cast(m, dtype)
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from pydantic import BaseModel, ConfigDict, model_validator
 
 
-def attn(x, scope, n_state, *, past, hparams, init_scale=1.0):
-    assert x.shape.ndims == 3  # Should be [batch, sequence, features]
-    assert n_state % hparams.n_head == 0
-    if past is not None:
-        assert past.shape.ndims == 5  # Should be [batch, 2, heads, sequence, features], where 2 is [k, v]
+class GPTConfig(BaseModel):
+    model_config = ConfigDict(extra='forbid')
 
-    def split_heads(x):
-        # From [batch, sequence, features] to [batch, heads, sequence, features]
-        return tf.transpose(split_states(x, hparams.n_head), [0, 2, 1, 3])
+    n_vocab:  int   = 0
+    n_ctx:    int   = 1024
+    n_embd:   int   = 768
+    n_head:   int   = 12
+    n_layer:  int   = 12
+    dropout:  float = 0.0
 
-    def merge_heads(x):
-        # Reverse of split_heads
-        return merge_states(tf.transpose(x, [0, 2, 1, 3]))
-
-    def mask_attn_weights(w):
-        # w has shape [batch, heads, dst_sequence, src_sequence], where information flows from src to dst.
-        _, _, nd, ns = shape_list(w)
-        b = attention_mask(nd, ns, dtype=w.dtype)
-        b = tf.reshape(b, [1, 1, nd, ns])
-        w = w*b - tf.cast(1e10, w.dtype)*(1-b)
-        return w
-
-    def multihead_attn(q, k, v):
-        # q, k, v have shape [batch, heads, sequence, features]
-        w = tf.matmul(q, k, transpose_b=True)
-        w = w * tf.math.rsqrt(tf.cast(v.shape[-1], w.dtype))
-
-        w = mask_attn_weights(w)
-        w = softmax(w)
-        a = tf.matmul(w, v)
-        return a
-
-    with tf1.variable_scope(scope):
-        c = conv1d(x, 'c_attn', n_state*3)
-        q, k, v = map(split_heads, tf.split(c, 3, axis=2))
-        present = tf.stack([k, v], axis=1)
-        if past is not None:
-            pk, pv = tf.unstack(past, axis=1)
-            k = tf.concat([pk, k], axis=-2)
-            v = tf.concat([pv, v], axis=-2)
-        a = multihead_attn(q, k, v)
-        a = merge_heads(a)
-        # Residual projection: scale init stdev by 1/sqrt(2*n_layer) per GPT-2 paper
-        a = conv1d(a, 'c_proj', n_state, w_init_stdev=0.02 * init_scale)
-        return a, present
+    @model_validator(mode='after')
+    def _check_head_divisibility(self):
+        if self.n_vocab > 0 and self.n_embd % self.n_head != 0:
+            raise ValueError(
+                f'n_embd ({self.n_embd}) must be divisible by n_head ({self.n_head})'
+            )
+        return self
 
 
-def mlp(x, scope, n_state, *, hparams, init_scale=1.0):
-    with tf1.variable_scope(scope):
-        nx = x.shape[-1]
-        h = gelu(conv1d(x, 'c_fc', n_state))
-        # Residual projection: scale init stdev by 1/sqrt(2*n_layer) per GPT-2 paper
-        h2 = conv1d(h, 'c_proj', nx, w_init_stdev=0.02 * init_scale)
-        return h2
+class CausalSelfAttention(nn.Module):
+    def __init__(self, config: GPTConfig):
+        super().__init__()
+        self.n_head   = config.n_head
+        self.n_embd   = config.n_embd
+        self.head_dim = config.n_embd // config.n_head
+        self.dropout_p = config.dropout
+
+        self.c_attn  = nn.Linear(config.n_embd, 3 * config.n_embd)
+        self.c_proj  = nn.Linear(config.n_embd, config.n_embd)
+        self.attn_drop = nn.Dropout(config.dropout)
+
+        # PyTorch >= 2.0 SDPA dispatches to Flash Attention on CUDA automatically.
+        self._use_sdpa = hasattr(F, 'scaled_dot_product_attention')
+        if not self._use_sdpa:
+            # Fallback causal mask for older PyTorch builds.
+            self.register_buffer(
+                'bias',
+                torch.tril(torch.ones(config.n_ctx, config.n_ctx))
+                     .view(1, 1, config.n_ctx, config.n_ctx),
+            )
+
+    def forward(self, x: torch.Tensor, past_kv=None):
+        B, T, C = x.shape
+        q, k, v = self.c_attn(x).split(self.n_embd, dim=2)
+        q = q.view(B, T, self.n_head, self.head_dim).transpose(1, 2)  # (B, nh, T, hd)
+        k = k.view(B, T, self.n_head, self.head_dim).transpose(1, 2)
+        v = v.view(B, T, self.n_head, self.head_dim).transpose(1, 2)
+
+        if past_kv is not None:
+            k = torch.cat([past_kv[0], k], dim=2)
+            v = torch.cat([past_kv[1], v], dim=2)
+
+        present_kv = (k, v)
+
+        if self._use_sdpa:
+            # is_causal=True only when processing the full prompt (no past cache):
+            # query and key have the same length, so standard causal masking applies.
+            # During incremental decode (past_kv is not None), T_q=1 can attend to
+            # all cached keys — no masking needed.
+            dp = self.dropout_p if self.training else 0.0
+            y = F.scaled_dot_product_attention(
+                q, k, v, dropout_p=dp, is_causal=(past_kv is None)
+            )
+        else:
+            scale = 1.0 / math.sqrt(self.head_dim)
+            att = (q @ k.transpose(-2, -1)) * scale
+            T_q, T_k = q.size(2), k.size(2)
+            att = att.masked_fill(
+                self.bias[:, :, T_k - T_q:T_k, :T_k] == 0, float('-inf')
+            )
+            att = F.softmax(att, dim=-1)
+            att = self.attn_drop(att)
+            y = att @ v
+
+        y = y.transpose(1, 2).contiguous().view(B, T, C)
+        return self.c_proj(y), present_kv
 
 
-def block(x, scope, *, past, hparams):
-    with tf1.variable_scope(scope):
-        nx = x.shape[-1]
-        # GPT-2 initializes residual projections with 0.02/sqrt(2*n_layer) to keep
-        # the residual stream variance stable at initialisation regardless of depth.
-        init_scale = 1.0 / math.sqrt(2 * hparams.n_layer)
-        a, present = attn(norm(x, 'ln_1'), 'attn', nx, past=past, hparams=hparams, init_scale=init_scale)
-        x = x + a
-        m = mlp(norm(x, 'ln_2'), 'mlp', nx*4, hparams=hparams, init_scale=init_scale)
-        x = x + m
-        return x, present
+class MLP(nn.Module):
+    def __init__(self, config: GPTConfig):
+        super().__init__()
+        self.c_fc   = nn.Linear(config.n_embd, 4 * config.n_embd)
+        self.c_proj = nn.Linear(4 * config.n_embd, config.n_embd)
+        self.drop   = nn.Dropout(config.dropout)
 
-def past_shape(*, hparams, batch_size=None, sequence=None):
-    return [batch_size, hparams.n_layer, 2, hparams.n_head, sequence, hparams.n_embd // hparams.n_head]
-
-def expand_tile(value, size):
-    """Add a new axis of given size."""
-    value = tf.convert_to_tensor(value, name='value')
-    ndims = value.shape.ndims
-    return tf.tile(tf.expand_dims(value, axis=0), [size] + [1]*ndims)
-
-def positions_for(tokens, past_length):
-    batch_size = tf.shape(tokens)[0]
-    nsteps = tf.shape(tokens)[1]
-    return expand_tile(past_length + tf.range(nsteps), batch_size)
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.drop(self.c_proj(F.gelu(self.c_fc(x), approximate='tanh')))
 
 
-def model(hparams, X, past=None, scope='model', reuse=tf1.AUTO_REUSE):
-    with tf1.variable_scope(scope, reuse=reuse):
-        results = {}
-        batch, sequence = shape_list(X)
+class Block(nn.Module):
+    def __init__(self, config: GPTConfig):
+        super().__init__()
+        self.ln_1 = nn.LayerNorm(config.n_embd)
+        self.attn = CausalSelfAttention(config)
+        self.ln_2 = nn.LayerNorm(config.n_embd)
+        self.mlp  = MLP(config)
 
-        wpe = tf1.get_variable('wpe', [hparams.n_ctx, hparams.n_embd],
-                             initializer=tf1.random_normal_initializer(stddev=0.01))
-        wte = tf1.get_variable('wte', [hparams.n_vocab, hparams.n_embd],
-                             initializer=tf1.random_normal_initializer(stddev=0.02))
-        past_length = 0 if past is None else tf.shape(past)[-2]
-        h = tf.gather(wte, X) + tf.gather(wpe, positions_for(X, past_length))
+    def forward(self, x: torch.Tensor, past_kv=None):
+        attn_out, present_kv = self.attn(self.ln_1(x), past_kv=past_kv)
+        x = x + attn_out
+        x = x + self.mlp(self.ln_2(x))
+        return x, present_kv
 
-        # Transformer
-        presents = []
-        pasts = tf.unstack(past, axis=1) if past is not None else [None] * hparams.n_layer
-        assert len(pasts) == hparams.n_layer
-        for layer, past in enumerate(pasts):
-            h, present = block(h, 'h%d' % layer, past=past, hparams=hparams)
-            presents.append(present)
-        results['present'] = tf.stack(presents, axis=1)
-        h = norm(h, 'ln_f')
 
-        # Language model loss.  Do tokens <n predict token n?
-        h_flat = tf.reshape(h, [batch*sequence, hparams.n_embd])
-        logits = tf.matmul(h_flat, wte, transpose_b=True)
-        logits = tf.reshape(logits, [batch, sequence, hparams.n_vocab])
-        results['logits'] = logits
-        return results
+class GPT(nn.Module):
+    def __init__(self, config: GPTConfig):
+        super().__init__()
+        self.config = config
+
+        self.transformer = nn.ModuleDict(dict(
+            wte  = nn.Embedding(config.n_vocab, config.n_embd),
+            wpe  = nn.Embedding(config.n_ctx,   config.n_embd),
+            drop = nn.Dropout(config.dropout),
+            h    = nn.ModuleList([Block(config) for _ in range(config.n_layer)]),
+            ln_f = nn.LayerNorm(config.n_embd),
+        ))
+        self.lm_head = nn.Linear(config.n_embd, config.n_vocab, bias=False)
+
+        # Weight tying: output projection shares the token embedding matrix.
+        self.transformer.wte.weight = self.lm_head.weight
+
+        self.apply(self._init_weights)
+        # GPT-2 residual projection scaling: keeps residual stream variance
+        # stable at init regardless of depth.
+        for name, p in self.named_parameters():
+            if name.endswith('c_proj.weight'):
+                nn.init.normal_(p, mean=0.0, std=0.02 / math.sqrt(2 * config.n_layer))
+
+    def _init_weights(self, module):
+        if isinstance(module, nn.Linear):
+            nn.init.normal_(module.weight, mean=0.0, std=0.02)
+            if module.bias is not None:
+                nn.init.zeros_(module.bias)
+        elif isinstance(module, nn.Embedding):
+            nn.init.normal_(module.weight, mean=0.0, std=0.02)
+
+    def forward(self, idx: torch.Tensor, targets=None, past_kvs=None):
+        B, T = idx.shape
+        device = idx.device
+        past_len = 0 if past_kvs is None else past_kvs[0][0].size(2)
+
+        pos = torch.arange(past_len, past_len + T, dtype=torch.long, device=device)
+        x = self.transformer.drop(
+            self.transformer.wte(idx) + self.transformer.wpe(pos)
+        )
+
+        new_kvs = []
+        for i, block in enumerate(self.transformer.h):
+            x, kv = block(x, past_kv=(past_kvs[i] if past_kvs is not None else None))
+            new_kvs.append(kv)
+
+        x = self.transformer.ln_f(x)
+        logits = self.lm_head(x)
+
+        loss = None
+        if targets is not None:
+            loss = F.cross_entropy(logits.reshape(-1, logits.size(-1)), targets.reshape(-1))
+
+        return logits, loss, new_kvs
+
+    @property
+    def num_params(self) -> int:
+        n = sum(p.numel() for p in self.parameters())
+        n -= self.transformer.wte.weight.numel()  # tied weight counted once
+        return n
+
+    def configure_optimizers(self, lr: float, weight_decay: float):
+        """AdamW: weight decay on matrices (dim >= 2), not on biases / LN params."""
+        seen, decay, nodecay = set(), [], []
+        for _, p in self.named_parameters():
+            if id(p) in seen or not p.requires_grad:
+                continue
+            seen.add(id(p))
+            (decay if p.dim() >= 2 else nodecay).append(p)
+        return torch.optim.AdamW(
+            [{'params': decay,   'weight_decay': weight_decay},
+             {'params': nodecay, 'weight_decay': 0.0}],
+            lr=lr, betas=(0.9, 0.95), eps=1e-8,
+        )

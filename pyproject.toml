@@ -1,17 +1,20 @@
 [project]
-name = "gpt-2"
-version = "0.1.0"
-description = "GPT-2 language model — OpenAI (archived)"
-requires-python = ">=3.10,<3.12"
+name = "pocketmodel"
+version = "0.2.0"
+description = "Train a GPT-style language model from your own text — no pre-trained weights"
+requires-python = ">=3.11,<3.14"
 dependencies = [
-    "tensorflow>=2.13,<2.16",
-    "fire>=0.1.3",
-    "regex>=2017.4.5",
-    "requests>=2.21.0",
-    "tqdm>=4.31.1",
-    "numpy<2.0",
-    "sentencepiece>=0.1.99",
+    "torch>=2.3",
+    "numpy>=2.0",
+    "tiktoken>=0.7",
+    "accelerate>=0.30",
+    "wandb>=0.17",
+    "pydantic>=2.7",
 ]
+
+[project.optional-dependencies]
+# flash-attn requires CUDA + compilation; PyTorch 2.x SDPA uses FA kernels automatically on CUDA
+flash = ["flash-attn>=2.5"]
 
 [tool.uv]
 python-preference = "managed"

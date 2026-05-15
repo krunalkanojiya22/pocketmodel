@@ -1,28 +1,35 @@
 # pocketmodel
 
-Train a GPT-style language model entirely from your own text — no pre-trained weights, no external vocab files. Scales from a tiny CPU-friendly model up to GPT-2 / GPT-3 architectures.
+Train a GPT-style language model entirely from your own text — no pre-trained weights, no cloud, no external vocab files. Scales from a tiny CPU model up to GPT-2 / GPT-3 architectures.
+
+Built on **PyTorch 2.x**, **Accelerate**, **tiktoken**, and **Pydantic**.
 
 ---
 
 ## Features
 
-- **Two tokenizer backends** — character-level (zero deps) or subword BPE via sentencepiece
+- **Two tokenizer backends** — character-level (zero deps, trains from your data) or tiktoken byte-level BPE (same vocab as GPT-2/3/4, 10× faster encoding)
+- **Flash Attention** — `F.scaled_dot_product_attention` dispatches to FA2 kernels on CUDA automatically; manual fallback for CPU / older PyTorch
+- **KV-cache inference** — O(1) per token in chat instead of O(n²); tokens stream as they generate
 - **Sliding-window chunks** — overlapping context windows for more training signal per token
 - **Train / validation split** — held-out eval loss tracked throughout training
 - **Linear warmup + cosine LR decay** — standard schedule used by GPT-2/3
-- **AdamW** — decoupled weight decay; biases and LayerNorm params are excluded
+- **AdamW** — PyTorch native, decoupled weight decay; biases and LayerNorm params excluded automatically
 - **Gradient clipping** — global norm clip prevents explosive updates
 - **Gradient accumulation** — simulate large batches without extra memory
-- **Mixed-precision training** — optional fp16 on supported GPUs
+- **Mixed-precision training** — fp16 on CUDA via Accelerate
+- **Multi-GPU training** — zero code changes; just run with `accelerate launch`
 - **Residual projection scaling** — `c_proj` weights initialised at `0.02 / sqrt(2 × n_layer)` per the GPT-2 paper
-- **KV-cache inference** — O(1) per token in chat instead of O(n²); tokens stream as they generate
-- **Resume training** — automatic checkpoint detection with hparam compatibility check
+- **Weight tying** — token embedding and output projection share the same matrix
+- **Resume training** — automatic checkpoint detection with config compatibility check
+- **Weights & Biases** — optional experiment tracking with `--wandb`
+- **Pydantic config** — typed, validated model config with JSON serialisation
 
 ---
 
 ## Requirements
 
-- Python 3.10 or 3.11
+- Python 3.11 or 3.12
 - [uv](https://docs.astral.sh/uv/getting-started/installation/) — fast Python package manager
 
 ---
@@ -33,7 +40,7 @@ Train a GPT-style language model entirely from your own text — no pre-trained 
 git clone <your-repo-url>
 cd pocketmodel
 
-# Creates .venv and installs all dependencies (including sentencepiece)
+# Creates .venv and installs all dependencies
 uv sync
 ```
 
@@ -48,7 +55,7 @@ curl -L https://raw.githubusercontent.com/karpathy/char-rnn/master/data/tinyshak
      -o data/shakespeare.txt
 ```
 
-Any `.txt` file works — the model builds its vocabulary from the text.
+Any `.txt` file works — just point `--dataset` at it.
 
 ### 2. Train
 
@@ -64,6 +71,14 @@ uv run python src/chat.py
 
 Type a prompt and the model streams its continuation. Type `/quit` to exit.
 
+```
+You › To be, or not to be
+
+Model › that is the question:
+Whether 'tis nobler in the mind to suffer
+The slings and arrows...
+```
+
 ---
 
 ## Training
@@ -74,21 +89,33 @@ Type a prompt and the model streams its continuation. Type `/quit` to exit.
 uv run python src/train.py --dataset data/shakespeare.txt
 ```
 
+---
+
 ### Tokenizer
 
 | Flag | Value | Description |
 |---|---|---|
-| `--tokenizer` | `char` *(default)* | Character-level; vocab built from training data |
-| `--tokenizer` | `bpe` | Subword BPE via sentencepiece; learns word-piece merges |
-| `--vocab_size` | `1000` *(default)* | Number of BPE pieces (ignored for `char`) |
+| `--tokenizer` | `char` *(default)* | Character-level; vocabulary built from training data |
+| `--tokenizer` | `tiktoken` | Byte-level BPE; fixed GPT-2/4 vocab, no training step needed |
+| `--tiktoken_encoding` | `gpt2` *(default)* | 50,257 tokens — matches GPT-2/3 |
+| `--tiktoken_encoding` | `cl100k_base` | 100,277 tokens — GPT-4, better for code and multilingual text |
+| `--tiktoken_encoding` | `o200k_base` | 200,019 tokens — GPT-4o, widest coverage |
 
 ```bash
-# BPE with 800 subword pieces
+# tiktoken with GPT-4 encoding
 uv run python src/train.py --dataset data/shakespeare.txt \
-    --tokenizer bpe --vocab_size 800
+    --tokenizer tiktoken --tiktoken_encoding cl100k_base
 ```
 
-BPE tokens carry more semantic content per step — the model learns faster on larger datasets. For tiny datasets (< 500 KB) the character tokenizer is usually fine.
+**When to use which:**
+
+| Dataset size | Recommendation |
+|---|---|
+| < 500 KB | `char` — simple, no overhead |
+| 500 KB – 10 MB | Either; tiktoken trains faster |
+| > 10 MB | `tiktoken` — far more efficient, richer token semantics |
+
+---
 
 ### Model presets
 
@@ -115,7 +142,9 @@ gpt3-13b              40      40    5120   2048               12.85 B
 gpt3-175b             96      96   12288   2048              174.60 B
 ```
 
-> **CPU training:** use `tiny` or `small-cpu`. Everything above `gpt2-small` needs a GPU.
+> **CPU training:** use `tiny` or `small-cpu`. Anything above `gpt2-small` needs a GPU.
+
+---
 
 ### Stopping conditions
 
@@ -132,7 +161,7 @@ uv run python src/train.py --dataset data/shakespeare.txt --steps 0 --min_loss 1
 uv run python src/train.py --dataset data/shakespeare.txt --steps 5000 --min_loss 1.2
 ```
 
-Ctrl+C always saves a checkpoint before exiting.
+Ctrl+C saves a checkpoint before exiting.
 
 #### Target loss values
 
@@ -144,23 +173,29 @@ Ctrl+C always saves a checkpoint before exiting.
 | ~1.2 | Readable text with consistent style |
 | < 0.5 | Overfitting — model is memorising the data |
 
+---
+
 ### Learning rate schedule
 
-Warmup + cosine decay is enabled by default. After `--warmup_steps` steps the LR rises linearly from 0 to `--learning_rate`, then decays via cosine to 10% of the peak.
+Linear warmup + cosine decay is enabled by default. LR rises from 0 to `--learning_rate` over `--warmup_steps` steps, then decays via cosine to 10% of the peak.
 
 ```bash
 uv run python src/train.py --dataset data/shakespeare.txt \
     --learning_rate 1e-3 --warmup_steps 200
 ```
 
+---
+
 ### AdamW (weight decay)
 
-Decoupled weight decay is applied after every optimiser step. Biases and LayerNorm parameters are excluded.
+Decoupled weight decay applied via PyTorch's native `AdamW`. Biases and LayerNorm parameters are automatically excluded from decay.
 
 ```bash
 # Increase weight decay to reduce overfitting on small datasets
 uv run python src/train.py --dataset data/shakespeare.txt --weight_decay 0.05
 ```
+
+---
 
 ### Gradient clipping
 
@@ -169,9 +204,11 @@ uv run python src/train.py --dataset data/shakespeare.txt --weight_decay 0.05
 uv run python src/train.py --dataset data/shakespeare.txt --clip_norm 0.5
 ```
 
+---
+
 ### Gradient accumulation
 
-Accumulate gradients over N micro-batches before one optimiser step. Effective batch size = `batch_size × accum_steps`.
+Accumulate gradients over N micro-batches before one optimizer step. Effective batch size = `batch_size × accum_steps`.
 
 ```bash
 # Effective batch = 2 × 4 = 8, same memory as batch_size=2
@@ -179,19 +216,23 @@ uv run python src/train.py --dataset data/shakespeare.txt \
     --batch_size 2 --accum_steps 4
 ```
 
+---
+
 ### Sliding-window chunks
 
-By default chunks are non-overlapping (`stride = n_ctx`). A smaller stride exposes more sequence boundaries to the model and is especially useful on small datasets.
+By default chunks are non-overlapping (`stride = n_ctx`). A smaller stride exposes more sequence boundaries and is useful on small datasets.
 
 ```bash
-# 50% overlap: twice as many training chunks from the same text
+# 50% overlap — twice as many training chunks from the same text
 uv run python src/train.py --dataset data/shakespeare.txt \
     --n_ctx 128 --stride 64
 ```
 
+---
+
 ### Validation split
 
-10% of tokens are held out by default. Validation loss is printed every `--eval_every` steps (defaults to `--save_every`).
+10% of tokens are held out by default. Validation loss is printed every `--eval_every` steps.
 
 ```bash
 # Disable validation
@@ -202,23 +243,56 @@ uv run python src/train.py --dataset data/shakespeare.txt \
     --val_fraction 0.15 --eval_every 50
 ```
 
+---
+
 ### Mixed precision (GPU only)
 
 ```bash
 uv run python src/train.py --dataset data/shakespeare.txt --fp16
 ```
 
-Requires a CUDA GPU and TensorFlow ≥ 2.4. Falls back to fp32 with a warning on unsupported hardware.
+Requires a CUDA GPU. Falls back gracefully on CPU.
+
+---
+
+### Multi-GPU training
+
+No code changes required — just launch with `accelerate`:
+
+```bash
+# Uses all visible GPUs
+accelerate launch src/train.py --dataset data/shakespeare.txt --fp16
+
+# Configure which GPUs, precision, etc.
+accelerate config   # interactive setup
+accelerate launch src/train.py --dataset data/shakespeare.txt
+```
+
+---
+
+### Weights & Biases logging
+
+```bash
+uv run python src/train.py --dataset data/shakespeare.txt --wandb
+
+# Custom project name
+uv run python src/train.py --dataset data/shakespeare.txt \
+    --wandb --wandb_project my-gpt-run
+```
+
+Logs `train_loss`, `val_loss`, and `lr` per step. Requires `wandb login` on first use.
+
+---
 
 ### Resume training
 
-Training resumes automatically from the latest checkpoint when `--save_dir` already contains one with matching architecture:
+Training resumes automatically from the latest checkpoint when `--save_dir` already contains one with a matching architecture:
 
 ```bash
 # First run
 uv run python src/train.py --dataset data/shakespeare.txt --steps 2000
 
-# Continue from step 2000
+# Continue from step 2000 — optimizer and LR schedule state restored
 uv run python src/train.py --dataset data/shakespeare.txt --steps 5000
 ```
 
@@ -229,6 +303,8 @@ uv run python src/train.py --dataset data/shakespeare.txt \
     --model gpt2-small --save_dir checkpoints/gpt2-small
 ```
 
+---
+
 ### Training on multiple files
 
 Point `--dataset` at a directory — all `.txt` and `.md` files are loaded and concatenated:
@@ -237,12 +313,14 @@ Point `--dataset` at a directory — all `.txt` and `.md` files are loaded and c
 uv run python src/train.py --dataset data/my_books/
 ```
 
+---
+
 ### Override individual architecture parameters
 
 Any `--n_*` flag overrides the corresponding preset value:
 
 ```bash
-# GPT-3 small architecture with a shorter context window
+# GPT-3 small with a shorter context window
 uv run python src/train.py --dataset data/shakespeare.txt \
     --model gpt3-small --n_ctx 256
 
@@ -251,19 +329,22 @@ uv run python src/train.py --dataset data/shakespeare.txt \
     --n_layer 6 --n_head 8 --n_embd 256 --n_ctx 512
 ```
 
+---
+
 ### Full argument reference
 
 | Argument | Default | Description |
 |---|---|---|
 | `--dataset` | *(required)* | Path to a `.txt` file or a directory of `.txt`/`.md` files |
 | `--model` | `small-cpu` | Model preset (see `--list_models`) |
-| `--save_dir` | `checkpoints` | Directory to save checkpoints and tokenizer |
-| `--tokenizer` | `char` | `char` or `bpe` |
-| `--vocab_size` | `1000` | BPE vocabulary size |
+| `--save_dir` | `checkpoints` | Directory for checkpoints, tokenizer, and config |
+| `--tokenizer` | `char` | `char` or `tiktoken` |
+| `--tiktoken_encoding` | `gpt2` | tiktoken encoding: `gpt2` \| `cl100k_base` \| `o200k_base` |
 | `--n_layer` | preset | Override transformer layers |
 | `--n_head` | preset | Override attention heads |
 | `--n_embd` | preset | Override embedding dimension (must be divisible by `n_head`) |
 | `--n_ctx` | preset | Override context window length |
+| `--dropout` | `0.0` | Dropout probability (useful to reduce overfitting on small datasets) |
 | `--stride` | `n_ctx` | Sliding-window stride for chunks |
 | `--val_fraction` | `0.1` | Fraction of tokens held out for validation (0 to disable) |
 | `--steps` | `500` | Max training steps (`0` = no limit) |
@@ -274,12 +355,14 @@ uv run python src/train.py --dataset data/shakespeare.txt \
 | `--weight_decay` | `0.01` | AdamW weight decay |
 | `--clip_norm` | `1.0` | Global gradient clip norm (0 to disable) |
 | `--accum_steps` | `1` | Gradient accumulation micro-steps |
-| `--fp16` | off | Enable mixed-precision training |
+| `--fp16` | off | Enable mixed-precision training (CUDA only) |
 | `--save_every` | `100` | Save a checkpoint every N steps |
 | `--eval_every` | `save_every` | Evaluate val loss every N steps |
 | `--sample_every` | `50` | Print a generated sample every N steps |
 | `--sample_length` | `200` | Tokens to generate per sample |
 | `--seed` | `42` | Random seed |
+| `--wandb` | off | Enable Weights & Biases logging |
+| `--wandb_project` | `pocketmodel` | W&B project name |
 
 ---
 
@@ -290,14 +373,6 @@ uv run python src/chat.py
 ```
 
 Tokens are streamed to the terminal as they are generated. The KV cache is reused across tokens, so generation stays fast regardless of response length.
-
-```
-You › To be, or not to be
-
-Model › that is the question:
-Whether 'tis nobler in the mind to suffer
-The slings and arrows...
-```
 
 ### Chat options
 
@@ -320,9 +395,9 @@ uv run python src/chat.py \
 
 | Command | Example | Effect |
 |---|---|---|
-| `/temp <value>` | `/temp 0.5` | Lower = more focused output |
-| `/topk <value>` | `/topk 40` | Higher = more varied word choices |
-| `/length <value>` | `/length 500` | Longer response |
+| `/temp <value>` | `/temp 0.5` | Adjust temperature on the fly |
+| `/topk <value>` | `/topk 40` | Adjust top-k sampling |
+| `/length <value>` | `/length 500` | Change response length |
 | `/quit` | `/quit` | Exit |
 
 ---
@@ -335,24 +410,27 @@ uv run python src/train.py --dataset data/shakespeare.txt \
     --model tiny --steps 500
 ```
 
-**Recommended first run:**
+**Recommended first run (CPU):**
 ```bash
 uv run python src/train.py --dataset data/shakespeare.txt \
     --model small-cpu --steps 0 --min_loss 1.2
 ```
 
-**BPE with sliding window (better quality, same size):**
+**tiktoken + sliding window (better quality, same size):**
 ```bash
 uv run python src/train.py --dataset data/shakespeare.txt \
-    --tokenizer bpe --vocab_size 800 \
+    --tokenizer tiktoken \
     --stride 64 --steps 0 --min_loss 1.0
 ```
 
 **Serious training (GPU recommended):**
 ```bash
-uv run python src/train.py --dataset data/shakespeare.txt \
-    --model gpt2-small --steps 0 --min_loss 0.9 \
+accelerate launch src/train.py --dataset data/shakespeare.txt \
+    --model gpt2-small \
+    --tokenizer tiktoken \
     --batch_size 8 --accum_steps 4 \
+    --steps 0 --min_loss 0.9 \
+    --fp16 --wandb \
     --save_dir checkpoints/gpt2-small
 ```
 
@@ -363,15 +441,18 @@ uv run python src/train.py --dataset data/shakespeare.txt \
 ```
 pocketmodel/
 ├── src/
-│   ├── train.py       # Training script
-│   ├── chat.py        # Interactive chat with streaming KV-cache inference
-│   ├── model.py       # GPT transformer (attention, MLP, residual blocks)
+│   ├── train.py       # Training script — PyTorch + Accelerate + wandb
+│   ├── chat.py        # Interactive chat — streaming KV-cache inference
+│   ├── model.py       # GPT transformer (Pydantic config, Flash Attention, KV cache)
 │   ├── configs.py     # Model size presets (tiny → GPT-3 175B)
-│   ├── tokenizer.py   # CharTokenizer and BPETokenizer with shared load factory
+│   ├── tokenizer.py   # CharTokenizer and TiktokenTokenizer with load factory
 │   └── dataset.py     # Text loading, train/val split, sliding-window chunking
 ├── data/
 │   └── shakespeare.txt  # Example dataset
 ├── checkpoints/         # Saved model weights (created during training)
+│   ├── ckpt_0000500.pt  # PyTorch checkpoint (model + optimizer + scheduler)
+│   ├── config.json      # Pydantic-serialised GPTConfig
+│   └── tokenizer.json   # Tokenizer metadata
 └── pyproject.toml
 ```
 
@@ -379,11 +460,28 @@ pocketmodel/
 
 ## Architecture Notes
 
-The model is a decoder-only transformer (same family as GPT-2/3) implemented in TensorFlow 1.x compatibility mode:
+Decoder-only transformer (same family as GPT-2/3) implemented in PyTorch 2.x:
 
-- **Token + position embeddings** — learned tables `wte` and `wpe`
-- **N transformer blocks** — each: LayerNorm → multi-head causal self-attention → residual, then LayerNorm → MLP (GELU, 4× hidden) → residual
-- **Final LayerNorm** → logit projection weight-tied to `wte`
-- **Causal mask** — lower-triangular attention prevents attending to future tokens
-- **Residual projection init** — `c_proj` in both attention and MLP is initialised with std `0.02 / sqrt(2 × n_layer)`, keeping residual stream variance stable at initialisation regardless of depth
-- **KV cache** — during inference, key/value tensors from prior positions are stored and concatenated rather than recomputed, making generation O(1) per token
+- **Token + position embeddings** — learned tables `wte` and `wpe`; weights tied to the output projection (no extra params for the LM head)
+- **N transformer blocks** — each: LayerNorm → multi-head causal self-attention → residual, then LayerNorm → MLP (GELU tanh-approx, 4× hidden) → residual
+- **Final LayerNorm** → logit projection (weight-tied to `wte`)
+- **Flash Attention** — `F.scaled_dot_product_attention` (PyTorch 2.0+) automatically uses Flash Attention 2 kernels on CUDA; safe fallback to manual attention with a registered causal mask on CPU or older PyTorch
+- **Causal mask** — lower-triangular; during incremental KV-cache decode the query (length 1) can attend to all cached keys without masking
+- **Residual projection init** — `c_proj` in both attention and MLP initialised with std `0.02 / sqrt(2 × n_layer)`, keeping residual stream variance stable at initialisation regardless of depth (GPT-2 paper)
+- **KV cache** — during inference, each block returns its `(k, v)` tensors; subsequent tokens concatenate to the cache rather than recomputing, giving O(1) generation per token
+- **AdamW param groups** — 2-D parameters (weight matrices, embeddings) receive weight decay; 1-D parameters (biases, LayerNorm scale/bias) do not; tied weights are deduplicated to avoid double-counting
+- **Accelerate integration** — `Accelerator` handles device placement, fp16 loss scaling, and gradient sync across GPUs with no changes to the training logic
+
+---
+
+## Library Stack
+
+| Library | Role |
+|---|---|
+| `torch >= 2.3` | Core framework — autograd, modules, Flash Attention via SDPA |
+| `numpy >= 2.0` | Data chunking and sampling |
+| `tiktoken >= 0.7` | Byte-level BPE tokenizer (GPT-2/4 vocab) |
+| `accelerate >= 0.30` | Multi-GPU, mixed precision, gradient sync |
+| `wandb >= 0.17` | Experiment tracking (optional) |
+| `pydantic >= 2.7` | Typed, validated model config with JSON serialisation |
+| `flash-attn >= 2.5` | *(optional)* Explicit FA2 for sequences > 4K or advanced kernels |

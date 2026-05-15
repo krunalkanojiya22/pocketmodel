@@ -1,10 +1,9 @@
 #!/usr/bin/env python3
 """
-Interactive chat with your trained GPT model.
+Interactive chat with your trained GPT model — PyTorch edition.
 
 Tokens are streamed to the terminal as they are generated.
-KV-cache (past key/value tensors) is reused across tokens so each
-generation step is O(1) in sequence length instead of O(n²).
+KV cache is maintained across decoding steps for O(1)-per-token generation.
 
 Usage:
     python src/chat.py
@@ -12,17 +11,18 @@ Usage:
 """
 
 import os
+import glob
 import json
 import argparse
-import numpy as np
-import tensorflow as tf
+import torch
 
-import model
 import tokenizer as tok_module
+from model import GPT, GPTConfig
 
-tf1 = tf.compat.v1
-tf1.disable_eager_execution()
 
+# ---------------------------------------------------------------------------
+# CLI
+# ---------------------------------------------------------------------------
 
 def parse_args():
     p = argparse.ArgumentParser()
@@ -37,177 +37,158 @@ def parse_args():
     return p.parse_args()
 
 
-def load_hparams(checkpoints_dir):
-    path = os.path.join(checkpoints_dir, 'hparams.json')
-    hp = model.default_hparams()
-    if os.path.exists(path):
-        with open(path) as f:
-            hp.override_from_dict(json.load(f))
-    return hp
+# ---------------------------------------------------------------------------
+# Model loading
+# ---------------------------------------------------------------------------
+
+def load_model(checkpoints_dir: str, device: torch.device):
+    config_path = os.path.join(checkpoints_dir, 'config.json')
+    if not os.path.exists(config_path):
+        raise FileNotFoundError(f"config.json not found in '{checkpoints_dir}'.")
+    with open(config_path) as f:
+        config = GPTConfig.model_validate(json.load(f))
+
+    ckpts = sorted(glob.glob(os.path.join(checkpoints_dir, 'ckpt_*.pt')))
+    if not ckpts:
+        raise FileNotFoundError(f"No checkpoint (ckpt_*.pt) found in '{checkpoints_dir}'.")
+
+    latest = ckpts[-1]
+    gpt = GPT(config)
+    ckpt = torch.load(latest, map_location='cpu', weights_only=True)
+    gpt.load_state_dict(ckpt['model'])
+    gpt.to(device).eval()
+    return gpt, config, latest
 
 
-def _sample_token(logits, temperature, top_k):
-    """Sample one token from logits using temperature + top-k."""
-    if top_k > 0:
-        top_indices = np.argsort(logits)[-top_k:]
-        mask = np.full_like(logits, -1e10)
-        mask[top_indices] = logits[top_indices]
-        logits = mask
+# ---------------------------------------------------------------------------
+# Inference
+# ---------------------------------------------------------------------------
+
+@torch.no_grad()
+def _sample_token(logits: torch.Tensor, temperature: float, top_k: int) -> int:
     logits = logits / max(temperature, 1e-8)
-    logits -= logits.max()
-    probs = np.exp(logits)
-    probs /= probs.sum()
-    return int(np.random.choice(len(probs), p=probs))
+    if top_k > 0:
+        vals, _ = torch.topk(logits, min(top_k, logits.size(-1)))
+        logits[logits < vals[-1]] = float('-inf')
+    probs = torch.softmax(logits, dim=-1)
+    return int(torch.multinomial(probs, 1).item())
 
 
-def generate_streaming(sess, tokenizer, hparams,
-                       X_prompt, prompt_logits, prompt_present,
-                       X_next, next_logits, next_present, past_ph,
-                       prompt_tokens, length, temperature, top_k):
+@torch.no_grad()
+def generate_streaming(model: GPT, tokenizer, device,
+                       prompt_tokens: list[int], length: int,
+                       temperature: float, top_k: int):
     """
     Yield decoded strings one token at a time using a KV cache.
 
-    On the first call the full prompt is processed in a single forward
-    pass and the resulting key/value tensors are stored in `past_np`.
-    Subsequent tokens each take a single O(1) incremental step that
-    reads one new token and the accumulated cache rather than
-    re-processing the whole sequence.
+    The full prompt is processed in one forward pass to build the initial
+    cache.  Each subsequent token then does a single O(1) incremental step
+    that extends the cache by one position instead of recomputing the whole
+    sequence.
     """
-    tokens = list(prompt_tokens) or [0]
-    prompt_arr = np.array([tokens], dtype=np.int32)
+    tokens = prompt_tokens or [0]
+    idx = torch.tensor([tokens], dtype=torch.long, device=device)
 
-    # Forward pass over the entire prompt — produces KV cache for all positions
-    logits_val, past_np = sess.run(
-        [prompt_logits, prompt_present],
-        feed_dict={X_prompt: prompt_arr},
-    )
-
-    # Sample first generated token from the last prompt position
-    next_tok = _sample_token(logits_val[0, -1, :], temperature, top_k)
+    # Full prompt forward pass — populates the KV cache for all prompt positions.
+    logits, _, past_kvs = model(idx)
+    next_tok = _sample_token(logits[0, -1], temperature, top_k)
     yield tokenizer.decode([next_tok])
 
     for _ in range(length - 1):
-        # Slide the window when we reach the context limit
-        if past_np.shape[4] >= hparams.n_ctx:
-            past_np = past_np[:, :, :, :, -(hparams.n_ctx - 1):, :]
+        # Trim the oldest cached position when we reach the context limit.
+        if past_kvs[0][0].size(2) >= model.config.n_ctx:
+            past_kvs = [(k[:, :, 1:], v[:, :, 1:]) for k, v in past_kvs]
 
-        tok_arr = np.array([[next_tok]], dtype=np.int32)
-        logits_val, new_present = sess.run(
-            [next_logits, next_present],
-            feed_dict={X_next: tok_arr, past_ph: past_np},
-        )
-        # Extend the KV cache along the sequence axis
-        past_np = np.concatenate([past_np, new_present], axis=4)
-
-        next_tok = _sample_token(logits_val[0, 0, :], temperature, top_k)
+        idx = torch.tensor([[next_tok]], dtype=torch.long, device=device)
+        logits, _, past_kvs = model(idx, past_kvs=past_kvs)
+        next_tok = _sample_token(logits[0, 0], temperature, top_k)
         yield tokenizer.decode([next_tok])
 
 
+# ---------------------------------------------------------------------------
+# Main
+# ---------------------------------------------------------------------------
+
 def main():
     args = parse_args()
+    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
     # ── Load tokenizer ───────────────────────────────────────────────────
-    tok_path = os.path.join(args.checkpoints_dir, 'tokenizer.json')
-    if not os.path.exists(tok_path):
-        print(f"[Error] tokenizer.json not found in '{args.checkpoints_dir}'.")
-        print("  Train the model first:  python src/train.py --dataset data/sample.txt")
+    try:
+        tokenizer = tok_module.load_tokenizer(args.checkpoints_dir)
+    except FileNotFoundError as e:
+        print(f'[Error] {e}')
+        print('  Train the model first:  python src/train.py --dataset data/sample.txt')
         return
+    print(f'Tokenizer loaded  ({tokenizer.n_vocab:,} vocab)')
 
-    tokenizer = tok_module.load_tokenizer(args.checkpoints_dir)
-    print(f"Tokenizer loaded  ({tokenizer.n_vocab} tokens in vocab)")
+    # ── Load model ───────────────────────────────────────────────────────
+    try:
+        model, config, ckpt_path = load_model(args.checkpoints_dir, device)
+    except FileNotFoundError as e:
+        print(f'[Error] {e}')
+        print('  Train the model first:  python src/train.py --dataset data/sample.txt')
+        return
+    print(f'Model loaded from {ckpt_path}  ({model.num_params:,} params, device={device})')
+    print(f'Settings → temperature={args.temperature}  top_k={args.top_k}  '
+          f'length={args.length}')
+    print('\nType a prompt and press Enter. The model streams its continuation.')
+    print('Commands:  /temp <value>   /topk <value>   /length <value>   /quit\n')
+    print('─' * 60)
 
-    # ── Load hparams ─────────────────────────────────────────────────────
-    hparams = load_hparams(args.checkpoints_dir)
+    temperature = args.temperature
+    top_k       = args.top_k
+    length      = args.length
 
-    # ── Build inference graph ────────────────────────────────────────────
-    with tf1.Session(graph=tf1.Graph()) as sess:
+    while True:
+        try:
+            prompt = input('\nYou › ').strip()
+        except (EOFError, KeyboardInterrupt):
+            print('\nGoodbye!')
+            break
 
-        # Prompt pass: process arbitrary-length input, return logits + KV cache
-        X_prompt       = tf1.placeholder(tf.int32, [1, None], name='X_prompt')
-        out_prompt     = model.model(hparams=hparams, X=X_prompt)
-        prompt_logits  = out_prompt['logits']
-        prompt_present = out_prompt['present']
+        if not prompt:
+            continue
 
-        # Incremental pass: one new token + accumulated KV cache
-        X_next        = tf1.placeholder(tf.int32, [1, 1], name='X_next')
-        past_ph       = tf1.placeholder(
-            tf.float32,
-            [1, hparams.n_layer, 2, hparams.n_head, None, hparams.n_embd // hparams.n_head],
-            name='past',
-        )
-        out_next      = model.model(hparams=hparams, X=X_next, past=past_ph)
-        next_logits   = out_next['logits']
-        next_present  = out_next['present']
-
-        saver = tf1.train.Saver(var_list=tf1.trainable_variables())
-        ckpt  = tf1.train.latest_checkpoint(args.checkpoints_dir)
-        if not ckpt:
-            print(f"[Error] No checkpoint found in '{args.checkpoints_dir}'.")
-            print("  Train the model first:  python src/train.py --dataset data/sample.txt")
-            return
-
-        saver.restore(sess, ckpt)
-        print(f"Model loaded from {ckpt}")
-        print(f"Settings  → temperature={args.temperature}  top_k={args.top_k}  length={args.length}")
-        print("\nType a prompt and press Enter. The model will stream its continuation.")
-        print("Commands:  /temp <value>   /topk <value>   /length <value>   /quit\n")
-        print("─" * 60)
-
-        temperature = args.temperature
-        top_k       = args.top_k
-        length      = args.length
-
-        while True:
+        # ── Runtime commands ─────────────────────────────────────────────
+        if prompt.startswith('/quit'):
+            print('Goodbye!')
+            break
+        elif prompt.startswith('/temp '):
             try:
-                prompt = input("\nYou › ").strip()
-            except (EOFError, KeyboardInterrupt):
-                print("\nGoodbye!")
-                break
+                temperature = float(prompt.split()[1])
+                print(f'  temperature → {temperature}')
+            except ValueError:
+                print('  Usage: /temp 0.8')
+            continue
+        elif prompt.startswith('/topk '):
+            try:
+                top_k = int(prompt.split()[1])
+                print(f'  top_k → {top_k}')
+            except ValueError:
+                print('  Usage: /topk 10')
+            continue
+        elif prompt.startswith('/length '):
+            try:
+                length = int(prompt.split()[1])
+                print(f'  length → {length}')
+            except ValueError:
+                print('  Usage: /length 200')
+            continue
 
-            if not prompt:
-                continue
+        # ── Generate (streaming) ─────────────────────────────────────────
+        prompt_tokens = tokenizer.encode(prompt)
+        if not prompt_tokens:
+            print('  [Warning] Prompt contained no known tokens.')
+            continue
 
-            # ── Commands ─────────────────────────────────────────────────
-            if prompt.startswith('/quit'):
-                print("Goodbye!")
-                break
-            elif prompt.startswith('/temp '):
-                try:
-                    temperature = float(prompt.split()[1])
-                    print(f"  temperature → {temperature}")
-                except ValueError:
-                    print("  Usage: /temp 0.8")
-                continue
-            elif prompt.startswith('/topk '):
-                try:
-                    top_k = int(prompt.split()[1])
-                    print(f"  top_k → {top_k}")
-                except ValueError:
-                    print("  Usage: /topk 10")
-                continue
-            elif prompt.startswith('/length '):
-                try:
-                    length = int(prompt.split()[1])
-                    print(f"  length → {length}")
-                except ValueError:
-                    print("  Usage: /length 200")
-                continue
-
-            # ── Generate (streaming) ─────────────────────────────────────
-            prompt_tokens = tokenizer.encode(prompt)
-            if not prompt_tokens:
-                print("  [Warning] Prompt contained no known tokens.")
-                continue
-
-            print("\nModel › ", end='', flush=True)
-            for piece in generate_streaming(
-                sess, tokenizer, hparams,
-                X_prompt, prompt_logits, prompt_present,
-                X_next, next_logits, next_present, past_ph,
-                prompt_tokens, length, temperature, top_k,
-            ):
-                print(piece, end='', flush=True)
-            print("\n" + "─" * 60)
+        print('\nModel › ', end='', flush=True)
+        for piece in generate_streaming(
+            model, tokenizer, device,
+            prompt_tokens, length, temperature, top_k,
+        ):
+            print(piece, end='', flush=True)
+        print('\n' + '─' * 60)
 
 
 if __name__ == '__main__':

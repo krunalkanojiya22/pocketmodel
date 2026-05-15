@@ -8,8 +8,14 @@ Single-GPU / CPU:
 Multi-GPU (all visible GPUs):
     accelerate launch src/train.py --dataset data/shakespeare.txt
 
-Mixed precision on CUDA:
-    accelerate launch src/train.py --dataset data/shakespeare.txt --fp16
+BF16 mixed precision (recommended for Ampere+ GPUs):
+    accelerate launch src/train.py --dataset data/shakespeare.txt --bf16
+
+Compile + gradient checkpointing for large models:
+    python src/train.py --dataset data/shakespeare.txt --compile --grad_checkpoint
+
+Pre-tokenised binary (fast startup for large datasets):
+    python src/train.py --dataset_bin data/books.npy --n_vocab 50257
 
 List presets:
     python src/train.py --list_models
@@ -42,59 +48,72 @@ def parse_args():
     )
     p.add_argument('--list_models', action='store_true',
                    help='Print all model presets and exit')
-    p.add_argument('--dataset',  default=None,
-                   help='Text file or directory of .txt/.md files')
+
+    # Data source — mutually exclusive: raw text OR pre-tokenised binary
+    src = p.add_mutually_exclusive_group()
+    src.add_argument('--dataset',     default=None,
+                     help='Text file or directory of .txt/.md files')
+    src.add_argument('--dataset_bin', default=None,
+                     help='Pre-tokenised .npy binary (from src/pretokenize.py)')
+
     p.add_argument('--model',    default='small-cpu',
                    help='Model preset (see --list_models)')
     p.add_argument('--save_dir', default='checkpoints')
 
-    # Tokenizer
-    p.add_argument('--tokenizer', default='char', choices=['char', 'tiktoken'],
-                   help='char (trains vocab from data) or tiktoken (fixed GPT-2/4 vocab)')
+    # Tokenizer (only used with --dataset, not --dataset_bin)
+    p.add_argument('--tokenizer', default='char', choices=['char', 'tiktoken'])
     p.add_argument('--tiktoken_encoding', default='gpt2',
-                   choices=['gpt2', 'cl100k_base', 'o200k_base'],
-                   help='tiktoken encoding — gpt2 | cl100k_base | o200k_base')
+                   choices=['gpt2', 'cl100k_base', 'o200k_base'])
 
     # Architecture overrides
-    p.add_argument('--n_layer',  type=int,   default=None)
-    p.add_argument('--n_head',   type=int,   default=None)
-    p.add_argument('--n_embd',   type=int,   default=None)
-    p.add_argument('--n_ctx',    type=int,   default=None)
-    p.add_argument('--dropout',  type=float, default=0.0)
+    p.add_argument('--n_layer',    type=int,   default=None)
+    p.add_argument('--n_head',     type=int,   default=None)
+    p.add_argument('--n_kv_head',  type=int,   default=None,
+                   help='GQA KV heads (default: same as n_head = full MHA)')
+    p.add_argument('--n_embd',     type=int,   default=None)
+    p.add_argument('--n_ctx',      type=int,   default=None)
+    p.add_argument('--n_vocab',    type=int,   default=None,
+                   help='Required when using --dataset_bin (tokenizer not loaded)')
+    p.add_argument('--dropout',    type=float, default=0.0)
+    p.add_argument('--rope_base',  type=float, default=10000.0,
+                   help='RoPE theta — increase for longer contexts (e.g. 500000 for LLaMA-3)')
 
     # Dataset
-    p.add_argument('--stride',        type=int,   default=None,
-                   help='Sliding-window stride (default: n_ctx = no overlap)')
-    p.add_argument('--val_fraction',  type=float, default=0.1,
-                   help='Fraction held out for validation (0 to disable)')
+    p.add_argument('--stride',        type=int,   default=None)
+    p.add_argument('--val_fraction',  type=float, default=0.1)
 
     # Training
     p.add_argument('--batch_size',    type=int,   default=2)
     p.add_argument('--learning_rate', type=float, default=1e-3)
-    p.add_argument('--steps',         type=int,   default=500,
-                   help='Max training steps (0 = no limit)')
-    p.add_argument('--min_loss',      type=float, default=None,
-                   help='Stop when train loss drops below this value')
+    p.add_argument('--steps',         type=int,   default=500)
+    p.add_argument('--min_loss',      type=float, default=None)
     p.add_argument('--warmup_steps',  type=int,   default=100)
     p.add_argument('--weight_decay',  type=float, default=0.01)
-    p.add_argument('--clip_norm',     type=float, default=1.0,
-                   help='Gradient clip norm (0 to disable)')
-    p.add_argument('--accum_steps',   type=int,   default=1,
-                   help='Gradient accumulation micro-steps per optimizer update')
-    p.add_argument('--fp16',          action='store_true',
-                   help='Mixed-precision training (requires CUDA)')
+    p.add_argument('--clip_norm',     type=float, default=1.0)
+    p.add_argument('--accum_steps',   type=int,   default=1)
+
+    # Precision — mutually exclusive
+    prec = p.add_mutually_exclusive_group()
+    prec.add_argument('--bf16', action='store_true',
+                      help='BF16 mixed precision (recommended for Ampere+ GPUs)')
+    prec.add_argument('--fp16', action='store_true',
+                      help='FP16 mixed precision (older CUDA GPUs)')
+
+    # Scaling flags
+    p.add_argument('--compile', action='store_true',
+                   help='torch.compile the model (~2× throughput, Linux/CUDA only)')
+    p.add_argument('--grad_checkpoint', action='store_true',
+                   help='Gradient checkpointing — trade 30%% compute for ~10× memory saving')
 
     # Logging / saving
     p.add_argument('--save_every',    type=int,   default=100)
-    p.add_argument('--eval_every',    type=int,   default=None,
-                   help='Evaluate val loss every N steps (default: save_every)')
+    p.add_argument('--eval_every',    type=int,   default=None)
     p.add_argument('--sample_every',  type=int,   default=50)
     p.add_argument('--sample_length', type=int,   default=200)
     p.add_argument('--seed',          type=int,   default=42)
 
     # wandb
-    p.add_argument('--wandb',         action='store_true',
-                   help='Enable Weights & Biases logging')
+    p.add_argument('--wandb',         action='store_true')
     p.add_argument('--wandb_project', default='pocketmodel')
 
     return p.parse_args()
@@ -106,22 +125,26 @@ def parse_args():
 
 def build_config(args, n_vocab: int) -> GPTConfig:
     preset = configs.get_preset(args.model)
-    if args.n_layer is not None: preset['n_layer'] = args.n_layer
-    if args.n_head  is not None: preset['n_head']  = args.n_head
-    if args.n_embd  is not None: preset['n_embd']  = args.n_embd
-    if args.n_ctx   is not None: preset['n_ctx']   = args.n_ctx
-    return GPTConfig(n_vocab=n_vocab, dropout=args.dropout, **preset)
+    if args.n_layer   is not None: preset['n_layer']   = args.n_layer
+    if args.n_head    is not None: preset['n_head']    = args.n_head
+    if args.n_kv_head is not None: preset['n_kv_head'] = args.n_kv_head
+    if args.n_embd    is not None: preset['n_embd']    = args.n_embd
+    if args.n_ctx     is not None: preset['n_ctx']     = args.n_ctx
+    return GPTConfig(
+        n_vocab   = n_vocab,
+        dropout   = args.dropout,
+        rope_base = args.rope_base,
+        **preset,
+    )
 
 
 def _lr_schedule(step: int, warmup: int, total: int, min_ratio: float = 0.1) -> float:
-    """Linear warmup then cosine decay to min_ratio × peak LR."""
     if step < warmup:
         return (step + 1) / max(1, warmup)
     if total == 0:
         return 1.0
     progress = min((step - warmup) / max(1, total - warmup), 1.0)
-    cosine = 0.5 * (1.0 + math.cos(math.pi * progress))
-    return min_ratio + (1.0 - min_ratio) * cosine
+    return min_ratio + (1.0 - min_ratio) * 0.5 * (1.0 + math.cos(math.pi * progress))
 
 
 @torch.no_grad()
@@ -130,8 +153,7 @@ def _sample_token(logits: torch.Tensor, temperature: float, top_k: int) -> int:
     if top_k > 0:
         vals, _ = torch.topk(logits, min(top_k, logits.size(-1)))
         logits[logits < vals[-1]] = float('-inf')
-    probs = torch.softmax(logits, dim=-1)
-    return int(torch.multinomial(probs, 1).item())
+    return int(torch.multinomial(torch.softmax(logits, dim=-1), 1).item())
 
 
 @torch.no_grad()
@@ -140,11 +162,11 @@ def generate_sample(model: GPT, tokenizer, device,
                     top_k: int = 10) -> str:
     model.eval()
     prime = tokenizer.encode('\n') or [0]
-    idx = torch.tensor([prime], dtype=torch.long, device=device)
+    idx   = torch.tensor([prime], dtype=torch.long, device=device)
 
     logits, _, past_kvs = model(idx)
     next_tok = _sample_token(logits[0, -1], temperature, top_k)
-    tokens = [next_tok]
+    tokens   = [next_tok]
 
     for _ in range(length - 1):
         if past_kvs[0][0].size(2) >= model.config.n_ctx:
@@ -179,7 +201,6 @@ def _ckpt_path(save_dir: str, step: int) -> str:
 
 
 def _latest_checkpoint(save_dir: str):
-    """Return (path, step) of the newest checkpoint, or (None, 0)."""
     ckpts = sorted(glob.glob(os.path.join(save_dir, 'ckpt_*.pt')))
     if not ckpts:
         return None, 0
@@ -188,16 +209,15 @@ def _latest_checkpoint(save_dir: str):
     return path, step
 
 
-def _save_checkpoint(accelerator: Accelerator, model, optimizer,
+def _save_checkpoint(accelerator: Accelerator, raw_model, optimizer,
                      scheduler, step: int, save_dir: str):
-    raw = accelerator.unwrap_model(model)
     torch.save({
         'step':      step,
-        'model':     raw.state_dict(),
+        'model':     raw_model.state_dict(),
         'optimizer': optimizer.state_dict(),
         'scheduler': scheduler.state_dict(),
     }, _ckpt_path(save_dir, step))
-    print(f'  ✓ Checkpoint saved: {_ckpt_path(save_dir, step)}')
+    print(f'  ✓ Checkpoint: {_ckpt_path(save_dir, step)}')
 
 
 # ---------------------------------------------------------------------------
@@ -211,15 +231,22 @@ def main():
         print('\n' + configs.list_presets() + '\n')
         sys.exit(0)
 
-    if args.dataset is None:
-        print('[Error] --dataset is required. Use --list_models to see presets.')
+    if args.dataset is None and args.dataset_bin is None:
+        print('[Error] Provide --dataset or --dataset_bin.')
         sys.exit(1)
 
     eval_every = args.eval_every if args.eval_every is not None else args.save_every
 
-    # ── Accelerate setup ─────────────────────────────────────────────────
+    # ── Accelerate ────────────────────────────────────────────────────────
+    if args.bf16:
+        mixed = 'bf16'
+    elif args.fp16:
+        mixed = 'fp16'
+    else:
+        mixed = 'no'
+
     accelerator = Accelerator(
-        mixed_precision='fp16' if args.fp16 else 'no',
+        mixed_precision=mixed,
         gradient_accumulation_steps=args.accum_steps,
     )
     device = accelerator.device
@@ -228,8 +255,13 @@ def main():
         torch.manual_seed(args.seed)
         np.random.seed(args.seed)
         os.makedirs(args.save_dir, exist_ok=True)
+        prec_str = {'bf16': 'BF16', 'fp16': 'FP16', 'no': 'FP32'}[mixed]
+        print(f'\nprecision={prec_str}  '
+              f'compile={args.compile}  '
+              f'grad_checkpoint={args.grad_checkpoint}  '
+              f'device={device}')
 
-    # ── wandb (optional) ─────────────────────────────────────────────────
+    # ── wandb ─────────────────────────────────────────────────────────────
     use_wandb = False
     if args.wandb and accelerator.is_main_process:
         try:
@@ -237,29 +269,37 @@ def main():
             wandb.init(project=args.wandb_project, config=vars(args))
             use_wandb = True
         except ImportError:
-            print("[Warning] wandb not installed — pip install wandb, or drop --wandb")
+            print('[Warning] wandb not installed — drop --wandb or pip install wandb')
 
-    # ── 1. Data + tokenizer ──────────────────────────────────────────────
+    # ── 1. Data ───────────────────────────────────────────────────────────
     if accelerator.is_main_process:
-        print('\n[ Step 1 ] Loading dataset...')
-    raw_text = dataset.read_all_text(args.dataset)
-    if accelerator.is_main_process:
-        print(f'  Characters: {len(raw_text):,}  |  Tokenizer: {args.tokenizer}')
+        print('\n[ Step 1 ] Loading data...')
 
-    if args.tokenizer == 'tiktoken':
-        tokenizer = tok_module.TiktokenTokenizer(encoding=args.tiktoken_encoding)
+    if args.dataset_bin:
+        # Fast path: pre-tokenised binary (uint32 numpy array)
+        if args.n_vocab is None:
+            print('[Error] --n_vocab is required when using --dataset_bin')
+            sys.exit(1)
+        tokens_np   = np.load(args.dataset_bin).astype(np.int32)
+        tokens      = tokens_np.tolist()
+        n_vocab     = args.n_vocab
+        tokenizer   = None
         if accelerator.is_main_process:
-            print(f'  tiktoken encoding: {args.tiktoken_encoding} '
-                  f'({tokenizer.n_vocab:,} tokens)')
+            print(f'  Loaded {len(tokens):,} tokens from {args.dataset_bin}')
     else:
-        tokenizer = tok_module.CharTokenizer().build_from_text(raw_text)
-
-    if accelerator.is_main_process:
-        tokenizer.save(args.save_dir)
-
-    tokens = tokenizer.encode(raw_text)
-    if accelerator.is_main_process:
-        print(f'  Total tokens: {len(tokens):,}')
+        raw_text = dataset.read_all_text(args.dataset)
+        if accelerator.is_main_process:
+            print(f'  Characters: {len(raw_text):,}  |  Tokenizer: {args.tokenizer}')
+        if args.tokenizer == 'tiktoken':
+            tokenizer = tok_module.TiktokenTokenizer(encoding=args.tiktoken_encoding)
+        else:
+            tokenizer = tok_module.CharTokenizer().build_from_text(raw_text)
+        if accelerator.is_main_process:
+            tokenizer.save(args.save_dir)
+        tokens  = tokenizer.encode(raw_text)
+        n_vocab = tokenizer.n_vocab
+        if accelerator.is_main_process:
+            print(f'  Tokens: {len(tokens):,}  |  Vocab: {n_vocab:,}')
 
     if args.val_fraction > 0:
         train_tokens, val_tokens = dataset.train_val_split(tokens, args.val_fraction)
@@ -268,27 +308,34 @@ def main():
     if accelerator.is_main_process:
         print(f'  Train: {len(train_tokens):,}  |  Val: {len(val_tokens):,}')
 
-    # ── 2. Model ─────────────────────────────────────────────────────────
-    config = build_config(args, tokenizer.n_vocab)
+    # ── 2. Model ──────────────────────────────────────────────────────────
+    config = build_config(args, n_vocab)
     if accelerator.is_main_process:
         print(f'\n[ Step 2 ] Model: {args.model}')
         approx = configs.estimate_params(
-            n_vocab=config.n_vocab, n_ctx=config.n_ctx,
-            n_embd=config.n_embd, n_head=config.n_head, n_layer=config.n_layer,
+            n_vocab   = config.n_vocab,
+            n_ctx     = config.n_ctx,
+            n_embd    = config.n_embd,
+            n_head    = config.n_head,
+            n_layer   = config.n_layer,
+            n_kv_head = config.n_kv_head,
         )
         print(f'  n_vocab={config.n_vocab}  n_ctx={config.n_ctx}  '
-              f'n_embd={config.n_embd}  n_head={config.n_head}  n_layer={config.n_layer}')
+              f'n_embd={config.n_embd}  n_head={config.n_head}  '
+              f'n_kv_head={config.n_kv_head}  n_layer={config.n_layer}')
+        print(f'  ffn_hidden={config.get_ffn_hidden()}  '
+              f'rope_base={config.rope_base}')
         print(f'  ~Params: {configs.format_params(approx)}')
 
-    stride = args.stride
+    stride       = args.stride
     train_chunks = dataset.make_chunks(train_tokens, config.n_ctx, stride=stride)
-    val_chunks = (
+    val_chunks   = (
         dataset.make_chunks(val_tokens, config.n_ctx)
         if len(val_tokens) > config.n_ctx else None
     )
     if accelerator.is_main_process:
         print(f'  Train chunks: {len(train_chunks):,}'
-              + (f'  |  Val chunks: {len(val_chunks):,}' if val_chunks is not None else ''))
+              + (f'  |  Val: {len(val_chunks):,}' if val_chunks is not None else ''))
 
     if len(train_chunks) < args.batch_size:
         raise ValueError(
@@ -296,19 +343,33 @@ def main():
             'Add more text or reduce --n_ctx / --val_fraction.'
         )
 
-    sampler = dataset.Sampler(train_chunks)
-    model = GPT(config)
-    if accelerator.is_main_process:
-        print(f'  Actual params: {model.num_params:,}')
+    sampler  = dataset.Sampler(train_chunks)
+    raw_model = GPT(config)
 
-    # ── Optimizer + LR scheduler ─────────────────────────────────────────
-    optimizer = model.configure_optimizers(args.learning_rate, args.weight_decay)
+    if args.grad_checkpoint:
+        raw_model.enable_gradient_checkpointing()
+        if accelerator.is_main_process:
+            print('  Gradient checkpointing: enabled')
+
+    if accelerator.is_main_process:
+        print(f'  Actual params: {raw_model.num_params:,}')
+
+    # torch.compile — applied BEFORE accelerate.prepare so DDP wraps the compiled graph
+    if args.compile:
+        if accelerator.is_main_process:
+            print('  Compiling with torch.compile (mode=max-autotune)...')
+        model = torch.compile(raw_model, mode='max-autotune')
+    else:
+        model = raw_model
+
+    # ── Optimizer + scheduler ─────────────────────────────────────────────
+    optimizer = raw_model.configure_optimizers(args.learning_rate, args.weight_decay)
     scheduler = torch.optim.lr_scheduler.LambdaLR(
         optimizer,
         lambda step: _lr_schedule(step, args.warmup_steps, args.steps),
     )
 
-    # ── Resume from checkpoint ───────────────────────────────────────────
+    # ── Resume ────────────────────────────────────────────────────────────
     ckpt_path, start_step = _latest_checkpoint(args.save_dir)
     config_path = os.path.join(args.save_dir, 'config.json')
 
@@ -317,7 +378,7 @@ def main():
             saved_cfg = GPTConfig.model_validate(json.load(f))
         if saved_cfg == config:
             ckpt = torch.load(ckpt_path, map_location='cpu', weights_only=True)
-            model.load_state_dict(ckpt['model'])
+            raw_model.load_state_dict(ckpt['model'])
             optimizer.load_state_dict(ckpt['optimizer'])
             scheduler.load_state_dict(ckpt['scheduler'])
             if accelerator.is_main_process:
@@ -325,8 +386,7 @@ def main():
         else:
             start_step = 0
             if accelerator.is_main_process:
-                print('\n  [Warning] Checkpoint config mismatch — starting fresh.')
-                print('            Use a different --save_dir to keep the old model.')
+                print('\n  [Warning] Config mismatch — starting fresh.')
     elif ckpt_path:
         start_step = 0
 
@@ -334,18 +394,18 @@ def main():
         with open(config_path, 'w') as f:
             json.dump(config.model_dump(), f, indent=2)
 
-    # ── Accelerate: wrap model, optimizer, scheduler ─────────────────────
+    # ── Accelerate wrap ───────────────────────────────────────────────────
     model, optimizer, scheduler = accelerator.prepare(model, optimizer, scheduler)
 
-    # ── 3. Training loop ─────────────────────────────────────────────────
+    # ── 3. Training loop ──────────────────────────────────────────────────
     step        = start_step
     stop_reason = 'completed'
 
     if accelerator.is_main_process:
         conds = []
-        if args.steps:         conds.append(f'steps={args.steps}')
-        if args.min_loss:      conds.append(f'min_loss={args.min_loss}')
-        if not conds:          conds.append('∞')
+        if args.steps:     conds.append(f'steps={args.steps}')
+        if args.min_loss:  conds.append(f'min_loss={args.min_loss}')
+        if not conds:      conds.append('∞')
         print(f'\n[ Step 3 ] Training | {" | ".join(conds)} | '
               f'batch={args.batch_size}×{args.accum_steps} | '
               f'lr={args.learning_rate} | warmup={args.warmup_steps} | '
@@ -361,7 +421,6 @@ def main():
                 stop_reason = f'reached --steps {args.steps}'
                 break
 
-            # ── Gradient accumulation ────────────────────────────────────
             optimizer.zero_grad()
             micro_losses = []
 
@@ -372,7 +431,6 @@ def main():
                         dtype=torch.long, device=device,
                     )
                     _, loss, _ = model(batch[:, :-1], targets=batch[:, 1:])
-                    # Scale loss so accumulated gradient equals the true mean.
                     accelerator.backward(loss / args.accum_steps)
                     micro_losses.append(loss.item())
 
@@ -384,24 +442,21 @@ def main():
 
             avg_loss   = float(np.mean(micro_losses))
             current_lr = scheduler.get_last_lr()[0]
-            step += 1
+            step      += 1
 
             if accelerator.is_main_process:
                 val_str = ''
                 if val_chunks is not None and step % eval_every == 0:
-                    vl = eval_val_loss(
-                        accelerator.unwrap_model(model),
-                        val_chunks, args.batch_size, device,
-                    )
+                    # unwrap to get the raw GPT (strips DDP/compile wrappers)
+                    raw = accelerator.unwrap_model(model)
+                    vl  = eval_val_loss(raw, val_chunks, args.batch_size, device)
                     val_str = f'{vl:>10.4f}'
                     if use_wandb:
-                        import wandb
-                        wandb.log({'val_loss': vl}, step=step)
+                        import wandb; wandb.log({'val_loss': vl}, step=step)
                 else:
                     val_str = f'{"":>10}'
 
                 print(f'{step:>6}  {avg_loss:>8.4f}  {val_str}  {current_lr:>10.6f}')
-
                 if use_wandb:
                     import wandb
                     wandb.log({'train_loss': avg_loss, 'lr': current_lr}, step=step)
@@ -410,16 +465,16 @@ def main():
                 stop_reason = f'loss {avg_loss:.4f} ≤ --min_loss {args.min_loss}'
                 break
 
-            if accelerator.is_main_process and step % args.sample_every == 0:
-                raw_model = accelerator.unwrap_model(model)
-                sample = generate_sample(raw_model, tokenizer, device,
-                                         args.sample_length)
+            if accelerator.is_main_process and tokenizer and step % args.sample_every == 0:
+                raw    = accelerator.unwrap_model(model)
+                sample = generate_sample(raw, tokenizer, device, args.sample_length)
                 print(f'\n{"─"*50}  sample @ step {step}')
                 print(sample)
                 print('─' * 50 + '\n')
 
             if accelerator.is_main_process and step % args.save_every == 0:
-                _save_checkpoint(accelerator, model, optimizer, scheduler,
+                raw = accelerator.unwrap_model(model)
+                _save_checkpoint(accelerator, raw, optimizer, scheduler,
                                  step, args.save_dir)
 
     except KeyboardInterrupt:
@@ -429,12 +484,12 @@ def main():
 
     finally:
         if step > start_step and accelerator.is_main_process:
-            _save_checkpoint(accelerator, model, optimizer, scheduler,
+            raw = accelerator.unwrap_model(model)
+            _save_checkpoint(accelerator, raw, optimizer, scheduler,
                              step, args.save_dir)
             print(f'\n[ Done ] {stop_reason}. Step {step}.')
             if use_wandb:
-                import wandb
-                wandb.finish()
+                import wandb; wandb.finish()
 
 
 if __name__ == '__main__':
